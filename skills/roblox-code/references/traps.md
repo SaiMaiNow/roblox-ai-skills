@@ -19,17 +19,22 @@ There is no error, no warning, and nothing in Output.
 grep -rn "FireServer\|FireClient\|FireAllClients\|OnServerEvent\|OnClientEvent" src | grep EventName
 ```
 
-Play mode cannot be reached over MCP, so this must be checked statically. It
-will not be caught by running the game unless a human plays exactly that path.
+Check it statically. A playtest only catches it if someone exercises exactly
+that path, and an automated one usually does not.
 
 ---
 
 ## Two Rojo connections duplicate every new file
 
 Two or more connected Rojo plugin sessions create each **new** file twice.
-Duplicate ModuleScripts appear, `Knit.AddControllers` throws on the duplicate
-name, and every controller dies at once - so the symptom is "all my systems
-stopped", not "there is a duplicate file".
+Duplicate ModuleScripts appear. Under Knit, `AddControllers` threw on the
+duplicate name and every controller died at once. A naive loader is worse: it
+loads both, every handler is connected twice, and every remote fires double -
+"damage is doubled" is not a symptom anyone traces to sync.
+
+The scaffold's Loader refuses the second copy with
+`[Loader] DUPLICATE system <name> ... skipped`. Treat that line as a sync bug,
+never as a code bug.
 
 *Fix:* one `rojo serve`, one plugin connect. After adding new files, count them
 in Studio before debugging anything else.
@@ -50,19 +55,20 @@ print("[Game] Server started - BUILD scaffold-1")
 
 If that exact line is not in Output on Play, Studio is not running the code on
 disk, and no edit can possibly take effect. Change the stamp text whenever you
-need certainty about which build is live. Checking `get_script_source` for a
-line you just wrote proves the same thing without a playtest.
+need certainty about which build is live. Checking `script_read` for a line
+you just wrote proves the same thing without a playtest.
 
 ---
 
-## A Knit method named like its cache field returns the function
+## A field named like a function returns the function
 
-If a service has a field `self.Foo` and a method `:Foo()`, the lookup resolves to
-the method. The caller gets a function where it expected data, type-checking is
-happy, and the failure surfaces somewhere unrelated.
+A module table has one namespace. `Thing.foo = {}` and `function Thing.foo()`
+are the same key; whichever is assigned last wins. The caller gets a function
+where it expected data (or the reverse), and the failure surfaces somewhere
+unrelated.
 
-*Fix:* prefix internal state with an underscore. `self._foo` and `:Foo()` cannot
-collide.
+*Fix:* keep state file-local (`local foo = {}`), never on the returned table.
+The returned table is the system's public surface: functions and signals only.
 
 ---
 
@@ -119,17 +125,30 @@ the ModuleScript under a new name, or restart the plugin.
 
 ---
 
-## Play mode is uninspectable
+## Play mode is observable - through a keyhole
 
-During a playtest: `capture_screenshot` is edit-mode only, `execute_luau` still
-reports `IsEdit = true, IsRunning = false` and only ever reaches the **edit**
-DataModel, `stop_playtest` is unreliable, and `VirtualInputManager` is
-unavailable from plugin context.
+This used to read "play mode is uninspectable", and with the old MCP tooling it
+was. Roblox Studio's built-in MCP server changed that: `start_stop_play` starts
+and stops a playtest, `get_console_output` reads its log, `execute_luau` takes a
+`datamodel_type` of `Client` or `Server` while playing, and `screen_capture`
+grabs the viewport. Gate 5 is built on exactly these.
 
-`LogService` via `get_playtest_output` is the only channel back.
+What has not changed:
 
-*Consequence:* a human must verify anything that only exists at runtime, and
-what they report is real evidence. On a previous build, the single defect that
+- It is a keyhole. You see the console, one snapshot of state, one frame. You do
+  not see a player's experience.
+- `execute_luau` with `datamodel_type: "Edit"` is rejected during a playtest; ask
+  `get_studio_state` which DataModels exist before calling it.
+- A yielding snippet still loses its output (see above), and a long one freezes
+  Studio.
+- Roblox's own playtest agent documents that it can report "Pass" when other
+  evidence says the test failed. An automated pass is a claim.
+- Always stop the playtest, even after a failure. A session left running blocks
+  the next one.
+
+*Consequence:* automate the boot check (build stamp, no errors, no `[Loader]`
+warnings), and let a human verify anything that only exists in play. What they
+report is real evidence. On a previous build, the single defect that
 mattered came from a playtest, not from any automated check, because the test
 stage was not a faithful stand-in for a live player character (a whole-model
 `Clone()` returns nil on a non-archivable instance, which a stage dummy never
@@ -169,6 +188,8 @@ measures "the right thing happened". Both are green. Only one is true.
 
 - `task.wait()` returns the elapsed time; `wait()` is deprecated and less precise.
 - `continue` exists in Luau loops. `goto` does not.
+- `require` by string is relative to the requiring file and must start with
+  `./` or `../`; an unprefixed string is an alias. Lune and Studio agree on this.
 - String interpolation is backticks: `` `hit {n} times` ``.
 - `+=`, `-=`, `*=` exist. `++` does not.
 - **Validate remote payloads with `typeof()`, never `type()`.** Measured in

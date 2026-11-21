@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Scaffold a Roblox game project that is green on the first commit.
 
-Emits the layout, the pinned toolchain, the Knit boot pair, the Net transport,
-a Config module, one pure Core module with a passing spec, and the headless test
-runner. `check.py` passes on a freshly scaffolded project, which is the point:
+Emits the layout, the pinned toolchain (Rokit), the Loader and its boot pair,
+the Net transport, a Config module, one pure Core module with a passing spec,
+and the headless test runner. `check.py` passes on a freshly scaffolded project, which is the point:
 step 0 of any build order is "the gates are green with nothing in the game yet",
 and a scaffold that cannot clear its own gates hides the first real failure.
 
@@ -17,13 +17,14 @@ import json
 import re
 from pathlib import Path
 
-AFTMAN = """# {title} - pinned toolchain (run `aftman install`)
+ROKIT = """# {title} - pinned toolchain (run `rokit install`)
+# Rokit also reads aftman.toml / foreman.toml, so older projects keep working.
 [tools]
-rojo = "rojo-rbx/rojo@7.4.1"
+rojo = "rojo-rbx/rojo@7.7.1"
 wally = "UpliftGames/wally@0.3.2"
-selene = "Kampfkarren/selene@0.28.0"
-stylua = "JohnnyMorganz/StyLua@0.20.0"
-lune = "lune-org/lune@0.8.9"
+selene = "Kampfkarren/selene@0.32.0"
+stylua = "JohnnyMorganz/StyLua@2.6.0"
+lune = "lune-org/lune@0.11.1"
 """
 
 WALLY = """[package]
@@ -33,8 +34,8 @@ registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 
 [dependencies]
-Knit = "sleitnick/knit@1.7.0"
-Promise = "evaera/promise@4.0.0"
+# No framework. Knit is archived (see Sleitnick/Knit ARCHIVAL.md); lifecycle is
+# the scaffold's own Loader and transport is Net.luau. These two are utilities.
 Signal = "sleitnick/signal@2.0.3"
 Trove = "sleitnick/trove@1.8.0"
 """
@@ -82,51 +83,139 @@ PROJECT = {
 }
 
 SERVER_BOOT = '''--!strict
--- {title} - server entry point.
--- Boots Knit (Services). Keep this file to the boot only; logic lives in Services.
+-- {title} - server entry point. Boot only; logic lives in Systems/.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
+local Loader = require(ReplicatedStorage.Shared.Loader)
 
-Knit.AddServices(script.Services)
+Loader.load(script.Systems)
 
-Knit.Start()
-\t:andThen(function()
-\t\t-- BUILD STAMP. If this exact line is not in Output on Play, Studio is NOT
-\t\t-- running the code on disk. Check the Rojo plugin is actually CONNECTED
-\t\t-- and syncing before debugging anything else - an established connection
-\t\t-- is not the same as an accepted one.
-\t\tprint("[{title}] Server started - BUILD scaffold-1")
-\tend)
-\t:catch(warn)
+-- BUILD STAMP. If this exact line is not in Output on Play, Studio is NOT
+-- running the code on disk. Check the Rojo plugin is actually CONNECTED and
+-- syncing before debugging anything else - an established connection is not
+-- the same as an accepted one.
+print("[{title}] Server started - BUILD scaffold-1")
 '''
 
 CLIENT_BOOT = '''--!strict
--- {title} - client entry point.
--- Boots Knit (Controllers). Keep this file to the boot only; logic lives in Controllers.
+-- {title} - client entry point. Boot only; logic lives in Systems/.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
+local Loader = require(ReplicatedStorage.Shared.Loader)
 
-Knit.AddControllers(script.Controllers)
+Loader.load(script.Systems)
 
-Knit.Start()
-\t:andThen(function()
-\t\t-- BUILD STAMP - see the note in the server boot.
-\t\tprint("[{title}] Client started - BUILD scaffold-1")
+-- BUILD STAMP - see the note in the server boot.
+print("[{title}] Client started - BUILD scaffold-1")
+'''
+
+LOADER = '''--!strict
+-- Loader - the whole lifecycle, in one small module. No framework.
+--
+-- Every direct ModuleScript child of a Systems folder is a system:
+--
+--   local MySystem = {{}}
+--   function MySystem.Init()  end -- own setup only. Do NOT call other systems.
+--   function MySystem.Start() end -- runs after EVERY Init. Other systems are ready.
+--   return MySystem
+--
+-- Both functions are optional. Systems reach each other with a plain
+-- require(script.Parent.Other), which keeps full types and autocomplete - the
+-- thing a name-keyed service registry (Knit.GetService("X")) cannot give you.
+--
+-- Order: require all (sorted by name) -> Init all, in order -> Start each in its
+-- own thread. A system that fails to require, Init or Start is warned BY NAME
+-- and skipped; the rest of the game keeps running.
+
+local SLOW_REQUIRE_SECONDS = 5
+
+type System = {{ Init: (() -> ())?, Start: (() -> ())? }}
+
+local Loader = {{}}
+
+function Loader.load(folder: Instance): {{ [string]: System }}
+\tlocal modules: {{ ModuleScript }} = {{}}
+\tlocal seen: {{ [string]: boolean }} = {{}}
+\tfor _, child in folder:GetChildren() do
+\t\tif not child:IsA("ModuleScript") then
+\t\t\tcontinue
+\t\tend
+\t\tif seen[child.Name] then
+\t\t\t-- Two Rojo connections create every new file twice. Loading both
+\t\t\t-- would connect every handler twice, so refuse loudly instead.
+\t\t\tlocal where = folder:GetFullName()
+\t\t\twarn(`[Loader] DUPLICATE system {{child.Name}} in {{where}} skipped. Rojo connected twice?`)
+\t\t\tcontinue
+\t\tend
+\t\tseen[child.Name] = true
+\t\ttable.insert(modules, child)
+\tend
+\ttable.sort(modules, function(a, b)
+\t\treturn a.Name < b.Name
 \tend)
-\t:catch(warn)
+
+\tlocal loaded: {{ {{ name: string, system: System }} }} = {{}}
+\tfor _, module in modules do
+\t\tlocal done = false
+\t\ttask.delay(SLOW_REQUIRE_SECONDS, function()
+\t\t\tif not done then
+\t\t\t\tlocal secs = SLOW_REQUIRE_SECONDS
+\t\t\t\twarn(`[Loader] {{module.Name}} still requiring after {{secs}}s - yield in Init/Start`)
+\t\t\tend
+\t\tend)
+\t\tlocal ok, result = pcall(require, module)
+\t\tdone = true
+\t\tif ok and type(result) == "table" then
+\t\t\ttable.insert(loaded, {{ name = module.Name, system = result :: System }})
+\t\telseif ok then
+\t\t\twarn(`[Loader] {{module.Name}} did not return a table - skipped`)
+\t\telse
+\t\t\twarn(`[Loader] require failed: {{module.Name}}: {{result}}`)
+\t\tend
+\tend
+
+\tlocal ready: {{ [string]: System }} = {{}}
+\tlocal order: {{ string }} = {{}}
+\tfor _, entry in loaded do
+\t\tlocal init = entry.system.Init
+\t\tif init then
+\t\t\tlocal ok, err = pcall(init)
+\t\t\tif not ok then
+\t\t\t\twarn(`[Loader] Init failed: {{entry.name}}: {{err}}`)
+\t\t\t\tcontinue
+\t\t\tend
+\t\tend
+\t\tready[entry.name] = entry.system
+\t\ttable.insert(order, entry.name)
+\tend
+
+\tfor _, name in order do
+\t\tlocal start = ready[name].Start
+\t\tif start then
+\t\t\ttask.spawn(function()
+\t\t\t\tlocal ok, err = pcall(start)
+\t\t\t\tif not ok then
+\t\t\t\t\twarn(`[Loader] Start failed: {{name}}: {{err}}`)
+\t\t\t\tend
+\t\t\tend)
+\t\tend
+\tend
+
+\treturn ready
+end
+
+return Loader
 '''
 
 NET = '''--!strict
 -- Net - the ONLY networking transport for gameplay and cross-client paths.
 --
--- Knit's auto-generated remotes are deliberately NOT used here. When play-mode
--- introspection is unreachable, the most primitive debuggable transport wins:
--- one folder of plain RemoteEvents, created server-side, awaited client-side,
--- every name declared in this file and nowhere else.
+-- No framework-generated remotes. Play mode can be observed only narrowly (the
+-- console, a screenshot), so the most primitive debuggable transport wins: one
+-- folder of plain RemoteEvents, created server-side, awaited client-side, every
+-- name declared in this file and nowhere else.
 --
 -- Server: Net.server("EventName") -> RemoteEvent (creates on first use)
 -- Client: Net.client("EventName") -> RemoteEvent? (nil on timeout - callers
@@ -190,17 +279,18 @@ CONFIG = '''--!strict
 -- GameConfig - every tunable in the game, in one place.
 --
 -- A number that a designer might want to change must live here, never inline in
--- a Service or Controller. This is what makes a balance pass a data edit.
+-- a System. This is what makes a balance pass a data edit. Data only: return a
+-- frozen table so nothing can mutate a tunable at runtime.
 
 export type Config = {{
 \tRespawnSeconds: number,
 \tMaxPlayers: number,
 }}
 
-local GameConfig: Config = {{
+local GameConfig: Config = table.freeze({{
 \tRespawnSeconds = 3,
 \tMaxPlayers = 4,
-}}
+}})
 
 return GameConfig
 '''
@@ -210,7 +300,7 @@ CORE = '''--!strict
 -- numbers and tables, no Instances, no services, no yielding.
 --
 -- If a rule can be written without touching an Instance, it MUST be, because
--- that is what makes it testable when play-mode introspection is unreachable.
+-- that is what makes it testable in a second, with no Studio and no playtest.
 -- Delete this module once the game has real ones - but keep the shape.
 
 local Health = {{}}
@@ -237,7 +327,7 @@ return Health
 '''
 
 SPEC = '''--!strict
--- Spec files are required BY the runner, so this path is relative to tests/.
+-- Requires are relative to THIS file (Luau require-by-string: ./ or ../).
 local Health = require("../src/shared/Core/Health")
 
 return {{
@@ -257,54 +347,52 @@ return {{
 }}
 '''
 
-SERVICE = '''--!strict
--- ExampleService - the shape every server Service takes.
+SERVER_SYSTEM = '''--!strict
+-- Example - the shape every server System takes. Loaded by Shared/Loader.
 --
 -- The server owns game state. Anything a client sends is a REQUEST, validated
 -- here before it changes anything.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
 local Net = require(ReplicatedStorage.Shared.Net)
 
-local ExampleService = Knit.CreateService({{
-\tName = "ExampleService",
-}})
+local Example = {{}}
 
-function ExampleService:KnitInit()
-\t-- Create remotes in Init so they exist before any client asks for them.
-\tself._ping = Net.server("Ping")
+local ping: RemoteEvent
+
+function Example.Init()
+\t-- Own setup only. Create remotes here so they exist before any client asks.
+\tping = Net.server("Ping")
 end
 
-function ExampleService:KnitStart()
-\tself._ping.OnServerEvent:Connect(function(player: Player, payload: unknown)
+function Example.Start()
+\t-- Every Init has run. Another system is reached with a plain require:
+\t--   local Other = require(script.Parent.Other)
+\tping.OnServerEvent:Connect(function(player: Player, payload: unknown)
 \t\t-- Validate every client input. Type first, then range, then ownership.
-\t\tif type(payload) ~= "string" or #payload > 64 then
+\t\tif typeof(payload) ~= "string" or #payload > 64 then
 \t\t\treturn
 \t\tend
-\t\tprint(`[ExampleService] {{player.Name}} says {{payload}}`)
+\t\tprint(`[Example] {{player.Name}} says {{payload}}`)
 \tend)
 end
 
-return ExampleService
+return Example
 '''
 
-CONTROLLER = '''--!strict
--- ExampleController - the shape every client Controller takes.
+CLIENT_SYSTEM = '''--!strict
+-- Example - the shape every client System takes. Loaded by Shared/Loader.
 --
 -- Clients own input and display. They ask; they never decide.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
 local Net = require(ReplicatedStorage.Shared.Net)
 
-local ExampleController = Knit.CreateController({{
-\tName = "ExampleController",
-}})
+local Example = {{}}
 
-function ExampleController:KnitStart()
+function Example.Start()
 \tlocal ping = Net.client("Ping")
 \tif not ping then
 \t\t-- Fail inert: one dead feature, not a dead client.
@@ -313,7 +401,7 @@ function ExampleController:KnitStart()
 \tping:FireServer("hello")
 end
 
-return ExampleController
+return Example
 '''
 
 RUNNER = '''--!strict
@@ -341,9 +429,10 @@ for _, fileName in fs.readDir(TESTS_DIR) do
 \t\tcontinue
 \tend
 \tlocal specPath = `{{TESTS_DIR}}/{{fileName}}`
-\t-- Lune's require appends .luau itself and resolves relative to the CWD,
-\t-- so this must be run from the project root.
-\tlocal requirePath = `{{TESTS_DIR}}/{{fileName:gsub("%.luau$", "")}}`
+\t-- fs paths are relative to the CWD (run from the project root), but require
+\t-- is relative to THIS file (Luau require-by-string), and an
+\t-- unprefixed path is read as an alias. This file lives in lune/, hence ../
+\tlocal requirePath = `../{{TESTS_DIR}}/{{fileName:gsub("%.luau$", "")}}`
 \tlocal ok, specOrErr = pcall(require, requirePath)
 \tif not ok then
 \t\tfailed += 1
@@ -371,17 +460,17 @@ README = """# {title}
 ## The five standing rules
 
 1. **Disk is the only source of truth.** Studio connects via `rojo serve`. Never
-   edit scripts inside Studio, never `set_script_source` over MCP. MCP is for
-   building geometry, inspection and screenshots only.
+   edit scripts inside Studio, never write script source over MCP. MCP is for
+   geometry, inspection, playtests and screenshots.
 2. **Pure logic lives in `src/shared/Core/`, Instances live at the edges.** If a
    function can be written without touching an Instance, it must be. That is
-   what makes it testable when play mode cannot be inspected.
+   what makes it testable in a second, without Studio.
 3. **Gameplay and cross-client paths use `src/shared/Net.luau`** (plain
-   RemoteEvents). Knit is lifecycle and DI scaffolding, not transport.
+   RemoteEvents). `Loader` is lifecycle only; it is never transport.
 4. **Cosmetics can never break gameplay.** Effects resolve async, fail inert,
    and every one is pcall-isolated.
 5. **Every tunable lives in `src/shared/Config/`.** Never hardcode a number in a
-   Service or Controller.
+   System.
 
 ## Layout
 
@@ -389,16 +478,17 @@ README = """# {title}
 src/shared/Core/        pure Luau, headless-tested   - no Instances
 src/shared/Config/      every design tunable         - data only
 src/shared/Net.luau     the one networking module    - plain RemoteEvents
-src/server/Services/    server-authoritative logic   - Knit Services
-src/client/Controllers/ input, camera, rendering     - Knit Controllers
+src/shared/Loader.luau  require -> Init -> Start     - the whole lifecycle
+src/server/Systems/     server-authoritative logic   - plain ModuleScripts
+src/client/Systems/     input, camera, rendering     - plain ModuleScripts
 tests/                  *.spec.luau, headless        - `lune run test`
 ```
 
 ## Commands
 
 ```sh
-aftman install                 # pinned tools
-wally install                  # Knit, Promise, Signal, Trove -> Packages/
+rokit install                  # pinned tools
+wally install                  # Signal, Trove -> Packages/
 rojo serve                     # live-sync to Studio (the ONLY sync path)
 lune run test                  # headless test suite
 selene src                     # lint
@@ -447,7 +537,7 @@ def main() -> int:
     project = json.loads(json.dumps(PROJECT))
     project["name"] = title
 
-    write(root / "aftman.toml", AFTMAN.format(**fmt))
+    write(root / "rokit.toml", ROKIT.format(**fmt))
     write(root / "wally.toml", WALLY.format(**fmt))
     write(root / "selene.toml", SELENE)
     write(root / "stylua.toml", STYLUA)
@@ -458,17 +548,18 @@ def main() -> int:
 
     write(root / "lune" / "test.luau", RUNNER.format(**fmt))
     write(root / "src" / "shared" / "Net.luau", NET.format(**fmt))
+    write(root / "src" / "shared" / "Loader.luau", LOADER.format(**fmt))
     write(root / "src" / "shared" / "Config" / "GameConfig.luau", CONFIG.format(**fmt))
     write(root / "src" / "shared" / "Core" / "Health.luau", CORE.format(**fmt))
     write(root / "tests" / "Health.spec.luau", SPEC.format(**fmt))
     write(root / "src" / "server" / "init.server.luau", SERVER_BOOT.format(**fmt))
-    write(root / "src" / "server" / "Services" / "ExampleService.luau", SERVICE.format(**fmt))
+    write(root / "src" / "server" / "Systems" / "Example.luau", SERVER_SYSTEM.format(**fmt))
     write(root / "src" / "client" / "init.client.luau", CLIENT_BOOT.format(**fmt))
-    write(root / "src" / "client" / "Controllers" / "ExampleController.luau", CONTROLLER.format(**fmt))
+    write(root / "src" / "client" / "Systems" / "Example.luau", CLIENT_SYSTEM.format(**fmt))
 
     print(f"scaffolded {title} -> {root}")
     print("\nnext, from that directory:")
-    print("  aftman install")
+    print("  rokit install")
     print("  wally install")
     print("  python ~/.claude/skills/roblox-code/scripts/check.py")
     print("\nthe scaffold is green on all gates before you write a line of game code.")

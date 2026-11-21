@@ -12,6 +12,8 @@ point running tests against a project that cannot be built.
 
 None of these open Studio. That is the point - a change is wrong on disk before
 it is ever wrong in a game, and disk is where it can be checked in a second.
+Gate 5 (a scripted playtest over the Studio MCP) comes after, and only once
+these are green - see SKILL.md.
 
     check.py                 # all gates, from the project root
     check.py --fix           # let stylua rewrite instead of failing
@@ -93,7 +95,7 @@ def main() -> int:
             code, out = run(["selene", "src"], root)
             results.append(report("selene          (lint)", code, out, a.verbose))
         else:
-            print(f"  {DIM}skip  selene not on PATH (aftman install){RESET}")
+            print(f"  {DIM}skip  selene not on PATH (rokit install){RESET}")
 
         if shutil.which("stylua"):
             targets = ["src"] + (["lune"] if (root / "lune").is_dir() else [])
@@ -104,7 +106,7 @@ def main() -> int:
             if code != 0 and not a.fix:
                 print(f"        {DIM}re-run with --fix to apply{RESET}")
         else:
-            print(f"  {DIM}skip  stylua not on PATH (aftman install){RESET}")
+            print(f"  {DIM}skip  stylua not on PATH (rokit install){RESET}")
 
     failed = results.count(False)
     print()
@@ -112,6 +114,7 @@ def main() -> int:
         print(f"{RED}{failed} gate(s) failed.{RESET}")
         return 1
     print(f"{GREEN}all gates green.{RESET}")
+    print(f"{DIM}next: rojo serve, then gate 5 - playtest over MCP and read the console.{RESET}")
     return 0
 
 

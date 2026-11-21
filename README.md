@@ -12,7 +12,7 @@ Free, as promised at 1,000 subscribers. Thank you for watching.
 |---|---|
 | `create-roblox-game` | The front door. One design file to a playable game, stage by stage |
 | `roblox-build-orchestrator` | Runs the asset stages in parallel with sub-agents and logs the build |
-| `roblox-code` | Scaffolds a Rojo + Knit project and proves code with 4 no-Studio gates |
+| `roblox-code` | Scaffolds a Rojo project (ModuleScript systems + Loader, no framework) and proves code with 4 no-Studio gates plus an MCP playtest gate |
 | `roblox-ui` | Builds GUI from a JSON spec: PNG mockup, Rojo model file and Luau builder |
 | `roblox-map` | Lays out maps from a spec and PROVES they are playable (reach, falls, sightlines) |
 | `roblox-3d-model` | Text or image to a game-ready MeshPart, through Blender |

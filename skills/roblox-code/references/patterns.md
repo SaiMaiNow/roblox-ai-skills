@@ -8,10 +8,11 @@ The shapes to copy. Each one exists because the alternative broke something.
 
 ```
 src/shared/Core/        pure Luau, headless-tested   - no Instances, no yielding
-src/shared/Config/      every design tunable         - data only
+src/shared/Config/      every design tunable         - data only, frozen
 src/shared/Net.luau     the one networking module    - plain RemoteEvents
-src/server/Services/    server-authoritative logic   - Knit Services
-src/client/Controllers/ input, camera, rendering     - Knit Controllers
+src/shared/Loader.luau  require -> Init -> Start     - the whole lifecycle
+src/server/Systems/     server-authoritative logic   - plain ModuleScripts
+src/client/Systems/     input, camera, rendering     - plain ModuleScripts
 tests/                  *.spec.luau                  - `lune run test`
 lune/test.luau          the runner
 ```
@@ -19,85 +20,131 @@ lune/test.luau          the runner
 Rojo maps `src/shared` to `ReplicatedStorage.Shared`, `src/server` to
 `ServerScriptService.Server`, `src/client` to `StarterPlayerScripts.Client`.
 `init.server.luau` and `init.client.luau` turn their folder into the Script
-itself, which is why the boot files sit at the top of each folder.
+itself, which is why the boot files sit at the top of each folder and why
+`script.Systems` is the folder next to them.
 
 **ServerScriptService is never replicated to clients. ReplicatedStorage always
-is.** A secret in `Shared/` is not a secret. Server-only data belongs in
-`ServerStorage` or `ServerScriptService`.
+is.** A secret in `Shared/` is not a secret. Server-only data (loot tables, drop
+rates, anti-cheat thresholds) belongs in `ServerStorage` or
+`ServerScriptService`. If a category has both public and secret values, use the
+same module name in both places.
+
+An existing project with its own clean layout (say `Config/`, `Lib/`, `Shared/`,
+`Systems/`) does not need renaming. The rules care about what lives where - pure
+logic, tunables, transport, lifecycle - not about folder names.
 
 ---
 
-## Knit Service (server)
+## Server system
 
 ```lua
 --!strict
+-- src/server/Systems/Flock.luau
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
 local Net = require(ReplicatedStorage.Shared.Net)
 local Config = require(ReplicatedStorage.Shared.Config.GameConfig)
+local Signal = require(ReplicatedStorage.Packages.Signal)
 
-local FlockService = Knit.CreateService({
-	Name = "FlockService",
-	-- Plain fields for state. Note the leading underscore convention: it is a
-	-- reminder that nothing outside this file may touch them.
-	_sheep = {} :: { [number]: Sheep },
-})
+local Flock = {}
 
-function FlockService:KnitInit()
-	-- Init: create things other code will look for. Remotes go here so they
-	-- exist before any client asks.
-	self._lost = Net.server("SheepLost")
+-- Public surface: functions and signals. Other systems use these.
+Flock.SheepLost = Signal.new()
+
+-- Private state stays file-local. Nothing outside this file can reach it,
+-- which is the whole point.
+local sheep: { [number]: Sheep } = {}
+local lostRemote: RemoteEvent
+
+function Flock.Init()
+	-- Own setup only: create things other code will look for. Remotes go
+	-- here so they exist before any client asks.
+	lostRemote = Net.server("SheepLost")
 end
 
-function FlockService:KnitStart()
-	-- Start: everything is constructed, other services may be used now.
-	local WolfService = Knit.GetService("WolfService")
-	WolfService.Killed:Connect(function(sheepId: number)
-		self:_remove(sheepId)
+function Flock.Start()
+	-- Every Init has run; other systems are usable now. Require them HERE,
+	-- not at the top of the file - no load order or circular-require trouble.
+	local Wolf = require(script.Parent.Wolf)
+	Wolf.Killed:Connect(function(sheepId: number)
+		Flock.remove(sheepId)
 	end)
 end
 
-function FlockService:_remove(sheepId: number)
-	self._sheep[sheepId] = nil
-	self._lost:FireAllClients(sheepId)
+function Flock.remove(sheepId: number)
+	sheep[sheepId] = nil
+	lostRemote:FireAllClients(sheepId)
+	Flock.SheepLost:Fire(sheepId)
 end
 
-return FlockService
+return Flock
 ```
 
-`KnitInit` runs for every service before any `KnitStart`. That ordering is the
-whole reason the two exist: reach for another service in `Start`, never in
+The Loader runs every system's `Init` before any `Start`. That ordering is the
+whole reason the two exist: reach for another system in `Start`, never in
 `Init`, or you will get a half-built one.
+
+`require(script.Parent.Wolf)` is fully typed - the editor autocompletes
+`Wolf.Killed`. That is what a string-keyed registry such as
+`Knit.GetService("WolfService")` cannot do, and why this skill no longer uses
+one.
 
 ---
 
-## Knit Controller (client)
+## Client system
 
 ```lua
 --!strict
+-- src/client/Systems/Flock.luau
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Knit = require(ReplicatedStorage.Packages.Knit)
 local Net = require(ReplicatedStorage.Shared.Net)
 
-local FlockController = Knit.CreateController({ Name = "FlockController" })
+local Flock = {}
 
-function FlockController:KnitStart()
+local function playLossFeedback(sheepId: number)
+	-- Display only, and pcall-isolated: cosmetics never break gameplay.
+end
+
+function Flock.Start()
 	local lost = Net.client("SheepLost")
 	if not lost then
 		-- Fail inert. One dead feature, not a dead client.
 		return
 	end
 	lost.OnClientEvent:Connect(function(sheepId: number)
-		-- Display only. The sheep is already gone on the server; this just
-		-- makes it look like it.
-		self:_playLossFeedback(sheepId)
+		-- The sheep is already gone on the server; this just makes it look like it.
+		local ok, err = pcall(playLossFeedback, sheepId)
+		if not ok then
+			warn(`[Flock] loss feedback failed inert: {err}`)
+		end
 	end)
 end
 
-return FlockController
+return Flock
 ```
+
+`Net.client` waits (with a timeout), so it belongs in `Start`, never at the top
+level of the file: a top-level yield holds up every system the Loader has not
+reached yet, and the Loader warns after five seconds.
+
+---
+
+## The Loader
+
+The scaffold ships it; this is what it guarantees, so a hand-written one in an
+existing project should too:
+
+- Loads direct `ModuleScript` children of the folder only, sorted by name, so
+  order is deterministic.
+- **Refuses duplicate names with a warning** instead of loading both (two Rojo
+  connections create each new file twice).
+- `require`, `Init` and `Start` are each `pcall`-wrapped and a failure is warned
+  with the system's name. One broken system never takes the others down.
+- A system whose `Init` failed is not started.
+- Each `Start` runs in its own `task.spawn`, so one long-running `Start` cannot
+  block the rest.
+- Warns when a `require` takes longer than five seconds.
 
 ---
 
@@ -143,7 +190,11 @@ rate-limiting it: one client in a loop stalls the thread for everyone.
 **Core takes plain numbers.** `Vector3` and `CFrame` are not globals in Lune
 (measured: `attempt to index nil with 'new'`), so a Core module that uses them
 cannot be required by a spec. Pass `(x, y, z)` scalars and construct the
-datatype at the edge, in the Service or Controller that owns the Instance.
+datatype at the edge, in the system that owns the Instance.
+
+Requires are relative to the requiring file and must start with `./` or `../`.
+Inside Core, require siblings as `require("./Other")` - the same line resolves
+under Lune and in Studio.
 
 ```lua
 --!strict
@@ -202,11 +253,11 @@ everything.
 ```lua
 local Trove = require(ReplicatedStorage.Packages.Trove)
 
-function WolfService:_spawn(cfg)
+local function spawnWolf(cfg)
 	local trove = Trove.new()
 	local wolf = trove:Add(WOLF_TEMPLATE:Clone())
-	trove:Connect(RunService.Heartbeat, function(dt) self:_hunt(wolf, dt) end)
-	trove:Add(function() self._active[wolf] = nil end)
+	trove:Connect(RunService.Heartbeat, function(dt) hunt(wolf, dt) end)
+	trove:Add(function() active[wolf] = nil end)
 	return trove -- caller calls :Destroy() and everything above unwinds
 end
 ```
