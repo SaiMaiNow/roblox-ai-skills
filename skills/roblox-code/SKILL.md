@@ -1,22 +1,23 @@
 ---
 name: roblox-code
-description: Write the Luau for a Roblox game the way it survives contact with a real playtest - server-authoritative, Knit services and controllers, plain RemoteEvents, every tunable in Config, every rule that can be pure written as a pure Core module with a headless spec - and PROVE it on disk before Studio ever sees it, through four gates (rojo build, lune run test, selene, stylua) that run in about a second and need no Studio at all. Scaffolds a complete project that is green on all four before a line of game code exists. Use whenever the user wants Roblox game code written, a game project set up, Rojo/Wally/Knit wired up, gameplay systems or services built, code reviewed for exploitability or replication bugs, or asks why their remote fires but nothing happens, why a script edit had no effect, why duplicate modules appeared, or why the character fights their own movement code.
+description: Write the Luau for a Roblox game the way it survives contact with a real playtest - server-authoritative, plain ModuleScript systems on a small Loader (no framework), plain RemoteEvents through one Net module, every tunable in Config, every rule that can be pure written as a pure Core module with a headless spec - and PROVE it on disk before Studio ever sees it, through four gates (rojo build, lune run test, selene, stylua) that run in about a second and need no Studio, then a fifth gate that playtests over the Studio MCP. Scaffolds a complete project that is green on the four disk gates before a line of game code exists. Use whenever the user wants Roblox game code written, a game project set up, Rojo/Rokit/Wally wired up, an existing Studio place moved onto disk, gameplay systems built, code reviewed for exploitability or replication bugs, or asks why their remote fires but nothing happens, why a script edit had no effect, why duplicate modules appeared, or why the character fights their own movement code.
 ---
 
-# Roblox code that can be proven without Studio
+# Roblox code that is proven before Studio sees it
 
 > **First time on this machine?** Read `LOCAL.md` in this folder. If it does not exist, run the
 > `roblox-skills-setup` skill (or copy `LOCAL.template.md` to `LOCAL.md` and fill it in).
 > `LOCAL.md` holds your paths and tool locations; it is yours and is never shared.
 
-The hard constraint on this platform is not the language, it is **feedback**. A
-running Roblox game is close to uninspectable from outside: `capture_screenshot`
-is edit-mode only, `execute_luau` only ever reaches the edit DataModel, and
-`VirtualInputManager` is unavailable from plugin context. During a playtest, the
-only channel back is `LogService`.
+The hard constraint on this platform is not the language, it is **feedback**.
+Roblox Studio's built-in MCP server can now start and stop a playtest, run Luau
+in the Client or Server DataModel while it plays, read the console and capture
+the screen. That is real, and it is used below. But it is slow, it observes a
+running game only narrowly, and an automated "pass" from it can be wrong.
 
-Everything below follows from that one fact. If the game cannot be watched while
-it runs, then **as much of it as possible must be decidable while it sits still.**
+So the rule is unchanged: **as much of the game as possible must be decidable
+while it sits still**, on disk, in a second. Studio is the last step, not the
+debugger.
 
 ```
 write code on disk
@@ -25,12 +26,13 @@ write code on disk
   -> selene           lint
   -> stylua --check   format
   -> rojo serve       Studio sees it     <- the FIRST time Studio is involved
-  -> playtest         a human, plus LogService
+  -> gate 5           scripted playtest over MCP: build stamp, no errors
+  -> playtest         a human, for anything only a player can judge
 ```
 
-Four gates before Studio. `scripts/check.py` runs them in that order and stops
-at the first, because a project that will not build makes every later message
-noise rather than signal.
+`scripts/check.py` runs gates 1-4 in that order and stops at the first build
+failure, because a project that will not build makes every later message noise
+rather than signal. Gate 5 is described under "When Studio is finally involved".
 
 ---
 
@@ -40,16 +42,18 @@ These came out of a v1 post-mortem on a real game that had to be rebuilt. They
 are not style preferences.
 
 **1. Disk is the only source of truth.** Studio connects via `rojo serve`. Never
-edit a script inside Studio, never `set_script_source` over MCP. MCP is for
-geometry, inspection and screenshots. (v1 died of Studio-to-disk drift.)
+edit a script inside Studio, and never write script source over MCP (no
+`multi_edit` on a script, no `execute_luau` that sets `.Source`). MCP is for
+geometry, inspection, playtests and screenshots. (v1 died of Studio-to-disk
+drift.)
 
 **2. Pure logic lives in `src/shared/Core/`, Instances live at the edges.** If a
 function can be written without touching an Instance, it must be. That is the
 only reason any of this is testable at all.
 
 **3. Gameplay and cross-client paths go through one `Net.luau`** of plain
-RemoteEvents, every name declared in one place. Knit is lifecycle and DI
-scaffolding, not transport. When you cannot watch the game run, the most
+RemoteEvents, every name declared in one place. The Loader is lifecycle only and
+never transport. When you can only watch the game through a keyhole, the most
 primitive debuggable transport wins.
 
 **4. Cosmetics can never break gameplay.** Effects resolve async, fail inert,
@@ -57,6 +61,52 @@ every one pcall-isolated. (v1's grapple was killed by a tracer.)
 
 **5. Every tunable lives in `src/shared/Config/`.** A balance pass must be a data
 edit, never a code edit.
+
+---
+
+## No framework: ModuleScripts and a Loader
+
+Earlier versions of this skill used Knit. **Knit is archived** - its author
+explains in `Sleitnick/Knit/ARCHIVAL.md` that its name-keyed registry
+(`Knit.GetService("X")`) carries no types, so editors cannot autocomplete it,
+and that a ModuleScript returning a table is already a singleton. Do not add
+Knit to new projects.
+
+What replaces it is about a hundred lines, shipped by the scaffold as
+`src/shared/Loader.luau`:
+
+```lua
+-- src/server/Systems/Damage.luau - every direct child of Systems/ is a system
+local Damage = {}
+
+function Damage.Init()  -- own setup only (create remotes, tables). Never call other systems.
+end
+
+function Damage.Start() -- runs after EVERY system's Init. Other systems are ready.
+	local Combat = require(script.Parent.Combat) -- typed, autocompletes
+end
+
+return Damage
+```
+
+`Loader.load(script.Systems)` requires every system (sorted by name), runs every
+`Init` in order, then each `Start` in its own thread. Any system that fails to
+require, Init or Start is warned **by name** and skipped; the rest of the game
+keeps running. It refuses duplicate names loudly (see the Rojo trap below) and
+warns when a require takes more than five seconds, which means something yields
+at the top level.
+
+Rules that make it work:
+
+- Require another system **inside `Start`** (or a function it calls), not at the
+  top of the file. That removes require-order and circular-require problems.
+- Talk to another system through its **functions and signals**, never by
+  reaching into its tables. A system holding lots of public data is being used
+  as hidden global state; that is the anti-pattern that sank Knit codebases.
+- Internal state stays file-local (`local states = {}`), not on the returned
+  table.
+
+Full shapes: `references/patterns.md`.
 
 ---
 
@@ -97,27 +147,57 @@ of movement (scoring, elimination, rewards) must stay on the server.
 python ~/.claude/skills/roblox-code/scripts/new_project.py "Coin Dash" \
     --dir ~/Projects/CoinDash
 cd ~/Projects/CoinDash
-aftman install && wally install
+rokit install && wally install
 python ~/.claude/skills/roblox-code/scripts/check.py
 ```
 
 That last command must print **all gates green** before any game code is written.
-Verified on a clean scaffold: rojo build, 3 tests, selene and stylua all pass.
 A scaffold that cannot clear its own gates hides the first real failure behind
 noise, so step 0 of every build order is "the gates are green with nothing in
 the game yet".
 
-What the scaffold gives you: pinned toolchain (rojo 7.4.1, wally 0.3.2, selene
-0.28.0, stylua 0.20.0, lune 0.8.9), Knit + Promise + Signal + Trove, the boot
-pair, `Net.luau`, `GameConfig`, one worked Core module with its spec, the
-headless runner, and a build stamp in both boot scripts.
+What the scaffold gives you: a Rokit-pinned toolchain (rojo 7.7.1, wally 0.3.2,
+selene 0.32.0, stylua 2.6.0, lune 0.11.1), Signal + Trove from Wally, the Loader
+and boot pair, one example system per side, `Net.luau`, a frozen `GameConfig`,
+one worked Core module with its spec, the headless runner, and a build stamp in
+both boot scripts.
+
+Rokit replaced Aftman (whose maintainer has moved on from Roblox tooling). It reads `aftman.toml`
+and `foreman.toml` too, so an older project needs no changes beyond installing
+Rokit.
+
+---
+
+## Move an existing Studio place onto disk
+
+A place whose scripts live only in Studio has no files yet. **Connecting Rojo
+first is how scripts get lost**: Rojo owns every subtree it maps, and anything
+in a mapped subtree that is not on disk is removed on sync.
+
+1. **Back up.** File > Save to File, a `.rbxl` that is never synced to.
+2. **Get the code onto disk.** `rojo syncback` (Rojo 7.7+) turns an existing
+   place into project files; read `rojo syncback --help` for the flags of the
+   installed version. Copying scripts out by hand works for a small place.
+3. **Map only code folders.** Point `$path` at the folders that hold scripts,
+   not at all of `ReplicatedStorage` or `Workspace`, unless every instance in
+   them is also on disk. Keep the place's existing folder names if it already
+   has a clean layout; nothing here requires `Shared`/`Server`/`Client`.
+4. **`rojo build` until green**, then `rojo serve` and connect once.
+5. Retrofit the rules in order of payoff: one `Net.luau` (remotes created in
+   systems move there), hardcoded numbers into `Config`, then Core modules with
+   specs for the rules that decide outcomes. Run `check.py --fix` once so StyLua
+   formats the whole tree in one commit.
+
+Studio's own **Script Sync** (beta) also syncs scripts with files both ways and
+needs no plugin. It is a fine way to edit in VS Code, but it has no project file,
+so gate 1 (`rojo build`) cannot run against it. This skill stays on Rojo.
 
 ---
 
 ## Check it
 
 ```bash
-python ~/.claude/skills/roblox-code/scripts/check.py            # all gates
+python ~/.claude/skills/roblox-code/scripts/check.py            # gates 1-4
 python ~/.claude/skills/roblox-code/scripts/check.py --fix      # let stylua rewrite
 python ~/.claude/skills/roblox-code/scripts/check.py --skip-lint  # build + tests only
 ```
@@ -153,19 +233,21 @@ return {
 }
 ```
 
-**Core modules take plain numbers, not Roblox datatypes.** Measured: `Vector3`
-and `CFrame` are not globals in Lune, so a Core module that uses them cannot be
-required by a spec at all. `require("@lune/roblox")` does provide them, but
-importing it into the module under test defeats the point of Core being pure.
-Pass `(x, y, z)` scalars across the boundary and build the `Vector3` at the edge,
-in the Service or Controller. Every Core module on the reference project follows
-this and it is the reason the suite runs at all.
+**Core modules take plain numbers, not Roblox datatypes.** `Vector3` and `CFrame`
+are not globals in Lune, so a Core module that uses them cannot be required by a
+spec at all. `require("@lune/roblox")` does provide them, but importing it into
+the module under test defeats the point of Core being pure. Pass `(x, y, z)`
+scalars across the boundary and build the `Vector3` at the edge, in the system.
+
+**Requires are relative to the requiring file** and must start with `./` or
+`../` (Luau require-by-string; current Lune and Roblox Studio both follow it). An
+unprefixed string is read as an alias. Inside Core, require siblings as
+`require("./Other")`: the same line then works under Lune and in Studio.
 
 A spec that restates the implementation is worth nothing. A spec that pins the
 boundary a designer argued about is worth the whole suite.
 
-More patterns, including the Knit service and controller shapes and the Net
-transport: `references/patterns.md`.
+More patterns: `references/patterns.md`.
 
 ---
 
@@ -178,9 +260,9 @@ knowing these exist is most of the value:
 arguments at one and the untouched middle silently drops every packet - no error
 anywhere. Grep the arity across all three before believing a fix.
 
-**Two Rojo connections duplicate every new file.** Two plugin connections create
-each new ModuleScript twice, `Knit.AddControllers` then throws on the duplicate
-name, and every controller dies at once. One server, one connect.
+**Two Rojo connections duplicate every new file.** Each new ModuleScript appears
+twice. The Loader refuses the second copy with a `DUPLICATE system` warning; a
+loader that did not would connect every handler twice. One server, one connect.
 
 **ROJO OWNS ITS SUBTREE. A RUNTIME CHILD OF ONE IS DELETED ON THE NEXT CONNECT.**
 Anything that must survive a sync has to live in the SOURCE Rojo serves - not in
@@ -222,8 +304,9 @@ everything looked connected. That is what the build stamp in the boot scripts is
 for: if that exact line is not in Output, Studio is not running your code and no
 edit you make can possibly matter.
 
-**A Knit method named the same as its cache field returns the function.** Silent,
-type-checks fine, and the value you get back is a function rather than data.
+**A module field named like a function returns the function.** A field
+`Thing.foo` and a function `Thing.foo` are the same key on the same table; the
+caller gets a function where it expected data. Keep state file-local.
 
 **A bare `pcall` hides the throw.** Always capture and warn the error, or the
 failure becomes invisible and you debug the wrong layer for an hour.
@@ -236,6 +319,10 @@ thing that holds.
 **`execute_luau` drops all output if the script yields.** Split it into two
 calls, or schedule with `task.delay` and return immediately.
 
+**An automated playtest "pass" is a claim, not a fact.** Roblox's own playtest
+agent can report a pass that other evidence contradicts. Gate 5 proves the build
+booted cleanly; it does not prove the feature feels right.
+
 **A verifier that cannot find its target must FAIL, not pass.** A check scoped to
 the wrong name reported green while 361 defects shipped underneath it. "Not
 found" is a failure result.
@@ -247,27 +334,51 @@ found" is a failure result.
 | Anti-pattern | Why it bites | Instead |
 |---|---|---|
 | `wait()`, `spawn()`, `delay()` | Deprecated scheduler, imprecise | `task.wait/spawn/delay/defer` |
-| A number hardcoded in a Service | Balance passes become code changes | `src/shared/Config/` |
+| A number hardcoded in a system | Balance passes become code changes | `src/shared/Config/` |
 | Remote names as bare strings | Typos fail silently | Declared in `Net.luau` |
-| Knit auto-remotes for gameplay | Undebuggable when play mode is opaque | `Net.luau` |
+| Framework auto-remotes or a string-keyed service locator | Untyped, undebuggable through a keyhole | `Net.luau`, plain `require` |
+| Knit in a new project | Archived, no types | ModuleScripts + `Loader` |
 | Client-stored state | Exploitable by definition | Server |
+| A system used as a bag of public data | Hidden global state | Functions and signals |
+| `require` of another system at top level | Order and circular-require failures | Require inside `Start` |
 | `require` inside a loop | Repeated resolution | Cache the reference |
-| Deep `require` chains | Circular dependency hell | Knit's service locator |
 | Unbounded `RunService.Heartbeat` work | Frame cost scales with players | Budget it, or use tags |
 
 ---
 
 ## When Studio is finally involved
 
-`rojo serve`, then check the build stamp in Output. After that, the MCP is for
-inspection only: `get_script_source` to confirm what Studio actually holds,
-`grep_scripts` to find call sites, `get_output_log` for errors.
+`rojo serve`, connect once, then check the build stamp in Output.
+
+The MCP tools below are the names in Roblox Studio's **built-in** MCP server
+(late 2026). Third-party servers use other names; map them, do not guess.
+
+- Inspect: `script_read` to confirm what Studio actually holds, `script_grep` /
+  `script_search` to find call sites, `search_game_tree` and `inspect_instance`
+  for the DataModel.
+- Run: `execute_luau` takes a `datamodel_type` - `Edit` outside a playtest,
+  `Client` or `Server` during one (`Edit` is rejected while playing). Call
+  `get_studio_state` first to see which are available.
+- Play: `start_stop_play`, `get_console_output`, `screen_capture`.
+
+**Gate 5 - the scripted playtest.** After gates 1-4 are green and Studio is
+synced:
+
+1. `start_stop_play` to start.
+2. `get_console_output`: the build stamp for **both** server and client must be
+   there, and there must be no `[Loader]` warnings and no errors. A missing stamp
+   means Studio is not running the code on disk - stop and fix the sync.
+3. Optional, for the feature just built: `execute_luau` with
+   `datamodel_type: "Server"` to read the state it should have produced. Keep the
+   snippet non-yielding.
+4. `start_stop_play` to stop. Always stop, even after a failure.
 
 Two things to know about the boundary:
 
 - `execute_luau`'s `require` is **cached**, so a changed module keeps running the
   old code. Verify via `.Source`, not by re-requiring.
-- Play mode cannot be inspected. A human has to watch it, and the finding they
-  bring back is real data - on one build, the only defect that mattered
-  came from a playtest, not from any automated verification, because the test
-  stage was not a faithful stand-in for a live player character.
+- Gate 5 checks that the game boots and the systems start. Whether it is fun,
+  readable or fair still needs a human, and the finding they bring back is real
+  data - on one build, the only defect that mattered came from a playtest, not
+  from any automated verification, because the test stage was not a faithful
+  stand-in for a live player character.
